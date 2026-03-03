@@ -36,71 +36,57 @@ FIELDS = {
                      "opts": ["Recreational", "Educational", "Cultural", "Commercial"]},
 }
 
-# ── LOAD CASES ────────────────────────────────────────────────
+EMBED_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
 
-@st.cache_resource
-def load_cases():
-    """Carica cases.json dalla root del repo."""
+# ── LOAD CASES + EMBEDDING MODEL ─────────────────────────────
+
+@st.cache_resource(show_spinner="Caricamento casi studio e modello embeddings…")
+def load_rag():
+    from sentence_transformers import SentenceTransformer
+
     p = Path("cases.json")
     if not p.exists():
-        return None, None
+        return None, None, None
+
     with open(p, encoding="utf-8") as f:
         cases = json.load(f)
-    embeddings = np.array([c["embedding"] for c in cases], dtype=np.float32)
-    return cases, embeddings
 
-CASES, EMBEDDINGS = load_cases()
+    embeddings = np.array([c["embedding"] for c in cases], dtype=np.float32)
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-9
+    embeddings = embeddings / norms
+
+    model = SentenceTransformer(EMBED_MODEL_NAME)
+    return cases, embeddings, model
+
+
+CASES, EMBEDDINGS, EMBED_MODEL_OBJ = load_rag()
 RAG_AVAILABLE = CASES is not None
 
 # ── RAG HELPERS ───────────────────────────────────────────────
 
-def cosine_sim(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Cosine similarity: a (1,D) vs b (N,D)."""
-    return (a @ b.T) / (np.linalg.norm(a) * np.linalg.norm(b, axis=1) + 1e-9)
-
-
-def embed_query(text: str) -> np.ndarray:
-    """Chiama l'API di embedding OpenRouter (usa il modello text-embedding-3-small)."""
-    try:
-        r = requests.post(
-            "https://openrouter.ai/api/v1/embeddings",
-            headers={"Authorization": f"Bearer {st.secrets['OPENROUTER_API_KEY']}"},
-            json={"model": "openai/text-embedding-3-small", "input": text},
-            timeout=10,
-        )
-        data = r.json()
-        return np.array(data["data"][0]["embedding"], dtype=np.float32)
-    except Exception:
-        return None
-
-
 def search_cases(query: str, top_k: int = 2):
-    """Restituisce i top_k casi più simili alla query."""
     if not RAG_AVAILABLE:
         return []
-    q_emb = embed_query(query)
-    if q_emb is None:
+    try:
+        q_emb = EMBED_MODEL_OBJ.encode([query], normalize_embeddings=True)
+        sims  = (q_emb @ EMBEDDINGS.T)[0]
+        top   = np.argsort(sims)[::-1][:top_k]
+        return [
+            {
+                "name":        CASES[i]["name"],
+                "city":        CASES[i]["city"],
+                "country":     CASES[i]["country"],
+                "year":        CASES[i].get("year", ""),
+                "description": (CASES[i].get("description") or "")[:300] + "…",
+                "score":       float(sims[i]),
+            }
+            for i in top
+        ]
+    except Exception:
         return []
-    # Normalize
-    q_emb = q_emb / (np.linalg.norm(q_emb) + 1e-9)
-    sims = cosine_sim(q_emb.reshape(1, -1), EMBEDDINGS)[0]
-    top_idx = np.argsort(sims)[::-1][:top_k]
-    results = []
-    for i in top_idx:
-        c = CASES[i]
-        results.append({
-            "name":        c["name"],
-            "city":        c["city"],
-            "country":     c["country"],
-            "year":        c.get("year", ""),
-            "description": (c.get("description") or "")[:300] + "…",
-            "score":       float(sims[i]),
-        })
-    return results
 
 
 def format_cases_for_llm(cases: list) -> str:
-    """Formatta i casi come contesto per il prompt."""
     if not cases:
         return ""
     lines = ["\n\n📚 ESEMPI SIMILI DAL DATABASE TALEA:"]
@@ -135,7 +121,7 @@ def call_llm(user_input: str, field_ctx: str = "", case_ctx: str = "") -> str:
         "Quando ti vengono forniti esempi simili, citali brevemente per arricchire il dialogo. "
         "Usa italiano formale."
     )
-    history = [{"role": m["role"], "content": m["content"]} for m in st.session_state.msgs]
+    history  = [{"role": m["role"], "content": m["content"]} for m in st.session_state.msgs]
     user_msg = user_input + field_ctx + case_ctx
 
     try:
@@ -143,8 +129,9 @@ def call_llm(user_input: str, field_ctx: str = "", case_ctx: str = "") -> str:
             "https://openrouter.ai/api/v1/chat/completions",
             headers={"Authorization": f"Bearer {st.secrets['OPENROUTER_API_KEY']}"},
             json={
-                "model":      st.session_state.model,
-                "messages":   [{"role": "system", "content": system}] + history + [{"role": "user", "content": user_msg}],
+                "model":    st.session_state.model,
+                "messages": [{"role": "system", "content": system}] + history
+                            + [{"role": "user", "content": user_msg}],
                 "max_tokens": 400,
             },
             timeout=30,
@@ -174,11 +161,9 @@ with st.sidebar:
 
     st.divider()
 
-    # Model selector
     sel = st.selectbox("Modello AI", list(MODELS.keys()))
     st.session_state.model = MODELS[sel]
 
-    # Progress
     n_done = len(st.session_state.done)
     n_tot  = len(FIELDS)
     st.progress(n_done / n_tot)
@@ -189,13 +174,11 @@ with st.sidebar:
 
     st.divider()
 
-    # Collected data
     if st.session_state.data:
         with st.expander("📋 Dati raccolti", expanded=True):
             for k, v in st.session_state.data.items():
                 st.caption(f"**{FIELDS[k]['label']}:** {v}")
 
-    # Similar cases in sidebar
     if st.session_state.last_cases:
         with st.expander("🔍 Esempi simili", expanded=True):
             for c in st.session_state.last_cases:
@@ -204,7 +187,6 @@ with st.sidebar:
                 st.caption(f"Similarità: {c['score']:.0%}")
                 st.divider()
 
-    # Download
     if n_done == n_tot:
         df = pd.DataFrame([st.session_state.data])
         st.download_button(
@@ -225,12 +207,10 @@ with st.sidebar:
 
 st.header("🌱 TALEA NBS Assistant — Sezione A")
 
-# Render history
 for m in st.session_state.msgs:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
 
-# Welcome message (only on first load)
 if not st.session_state.msgs:
     welcome = (
         "Ciao! Sono l'assistente TALEA NBS. "
@@ -242,15 +222,12 @@ if not st.session_state.msgs:
     with st.chat_message("assistant"):
         st.markdown(welcome)
 
-# Chat input
 if user_input := st.chat_input("Scrivi qui la tua risposta…"):
 
-    # Show user message
     st.session_state.msgs.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    # Save current field value
     if st.session_state.curr:
         st.session_state.data[st.session_state.curr] = user_input
         st.session_state.done.append(st.session_state.curr)
@@ -258,7 +235,6 @@ if user_input := st.chat_input("Scrivi qui la tua risposta…"):
     nxt = next_field()
 
     if not nxt:
-        # All fields done
         reply = (
             "✅ **Sezione A completata!**\n\n"
             "Tutti i campi sono stati raccolti. "
@@ -272,24 +248,18 @@ if user_input := st.chat_input("Scrivi qui la tua risposta…"):
     else:
         f = FIELDS[nxt]
 
-        # Build field context
         field_ctx = f"\n\n[CAMPO DA COMPILARE: {f['label']} | Domanda suggerita: {f['q']}"
         if "opts" in f:
             field_ctx += f" | Opzioni valide: {', '.join(f['opts'])}"
         field_ctx += "]"
 
-        # RAG: build query from current data + user input
-        rag_query = user_input
-        if st.session_state.data:
-            ctx_parts = [f"{FIELDS[k]['label']}: {v}" for k, v in st.session_state.data.items()]
-            rag_query = "; ".join(ctx_parts) + "; " + user_input
+        ctx_parts = [f"{FIELDS[k]['label']}: {v}" for k, v in st.session_state.data.items()]
+        rag_query = "; ".join(ctx_parts + [user_input])
 
-        similar = search_cases(rag_query, top_k=2)
+        similar  = search_cases(rag_query, top_k=2)
         st.session_state.last_cases = similar
+        case_ctx = format_cases_for_llm(similar)
 
-        case_ctx = format_cases_for_llm(similar) if similar else ""
-
-        # Call LLM
         with st.spinner("💭 Elaborazione…"):
             reply = call_llm(user_input, field_ctx, case_ctx)
 
